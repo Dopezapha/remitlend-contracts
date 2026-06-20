@@ -21,6 +21,7 @@ pub enum PoolError {
     NoProposedAdmin = 10,
     CooldownTooLong = 11,
     NotPaused = 12,
+    WithdrawalCooldownActive = 13,
 }
 
 /// Storage keys.
@@ -300,20 +301,26 @@ impl LendingPool {
             .ok_or(PoolError::InvalidAmount)
     }
 
-    fn assert_withdrawal_cooldown_elapsed(env: &Env, provider: &Address, token: &Address) {
+    fn assert_withdrawal_cooldown_elapsed(
+        env: &Env,
+        provider: &Address,
+        token: &Address,
+    ) -> Result<(), PoolError> {
         let cooldown = Self::withdrawal_cooldown(env);
         if cooldown == 0 {
-            return;
+            return Ok(());
         }
 
         let Some(deposit_ledger) = Self::read_deposit_timestamp(env, provider, token) else {
-            return;
+            return Ok(());
         };
 
         let current_ledger = env.ledger().sequence();
         if current_ledger < deposit_ledger.saturating_add(cooldown) {
-            panic!("withdrawal_cooldown_active");
+            return Err(PoolError::WithdrawalCooldownActive);
         }
+
+        Ok(())
     }
 
     /// Burns `shares` for `provider` and transfers out the proportional
@@ -726,7 +733,7 @@ impl LendingPool {
     ) -> Result<(), PoolError> {
         provider.require_auth();
         Self::assert_not_paused(&env)?;
-        Self::assert_withdrawal_cooldown_elapsed(&env, &provider, &token);
+        Self::assert_withdrawal_cooldown_elapsed(&env, &provider, &token)?;
         let assets = Self::redeem_shares(&env, &provider, &token, shares)?;
         withdraw(&env, provider, token, assets, shares);
         Ok(())
