@@ -3101,3 +3101,121 @@ fn test_approve_loan_uses_borrower_requested_term_not_default() {
         "due_date must be derived from the borrower-requested term"
     );
 }
+
+// ── Issue #2: repaid interest reaches LPs via record_yield ──────────────────
+
+#[test]
+fn test_repayment_interest_credited_to_pool_lps() {
+    // End-to-end: once the pool derives share value from managed assets
+    // (lending_pool #2), repaid interest must still reach LPs automatically.
+    // The loan manager reports the interest portion via record_yield.
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let (manager, nft_client, pool_addr, token_id, _admin) = setup_test(&env);
+    let pool_client = LendingPoolClient::new(&env, &pool_addr);
+
+    // Wire the pool to accept yield reports from this loan manager.
+    pool_client.set_loan_manager(&token_id, &manager.address);
+    pool_client.set_withdrawal_cooldown(&0);
+
+    let stellar_token = StellarAssetClient::new(&env, &token_id);
+
+    // An LP supplies real liquidity, so LP shares exist.
+    let lp = Address::generate(&env);
+    stellar_token.mint(&lp, &10_000);
+    pool_client.deposit(&lp, &token_id, &10_000);
+    assert_eq!(pool_client.get_total_managed_assets(&token_id), 10_000);
+    assert_eq!(pool_client.get_deposit(&lp, &token_id), 10_000);
+
+    // Borrower with a passing score.
+    let borrower = Address::generate(&env);
+    let history_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    nft_client.mint(
+        &borrower,
+        &600,
+        &history_hash,
+        &String::from_str(&env, "ipfs://QmTest"),
+        &None,
+    );
+    stellar_token.mint(&borrower, &10_000);
+
+    // Start from a non-zero ledger so interest accrual is active (a zero
+    // last_interest_ledger is treated as "not started").
+    env.ledger().set_sequence_number(1_000);
+
+    // Disburse a loan and let a full term of interest accrue.
+    let loan_id = manager.request_loan(&borrower, &1_000, &17_280);
+    manager.approve_loan(&loan_id);
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 17_280);
+
+    let loan = manager.get_loan(&loan_id);
+    assert!(loan.accrued_interest > 0, "interest should have accrued");
+    let total_debt = loan.amount + loan.accrued_interest + loan.accrued_late_fee
+        - loan.principal_paid
+        - loan.interest_paid
+        - loan.late_fee_paid;
+
+    manager.repay(&borrower, &loan_id, &total_debt);
+    assert_eq!(manager.get_loan(&loan_id).status, LoanStatus::Repaid);
+
+    // The interest portion is now reflected in LP share value automatically.
+    let managed = pool_client.get_total_managed_assets(&token_id);
+    assert!(
+        managed > 10_000,
+        "managed assets should grow by the repaid interest"
+    );
+    // The single LP owns every share, so their redeemable value equals managed.
+    assert_eq!(pool_client.get_deposit(&lp, &token_id), managed);
+    // Principal tracking is unaffected by yield.
+    assert_eq!(pool_client.get_total_deposits(&token_id), 10_000);
+}
+
+#[test]
+fn test_repayment_succeeds_when_pool_reporter_not_configured() {
+    // If the pool has not authorized this manager as a yield reporter, repayment
+    // must still succeed (yield reporting is best-effort and never blocks a
+    // repayment); the interest simply sits as uncounted pool surplus.
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let (manager, nft_client, pool_addr, token_id, _admin) = setup_test(&env);
+    let pool_client = LendingPoolClient::new(&env, &pool_addr);
+    // NOTE: deliberately NOT calling set_loan_manager.
+
+    let stellar_token = StellarAssetClient::new(&env, &token_id);
+    let lp = Address::generate(&env);
+    stellar_token.mint(&lp, &10_000);
+    pool_client.set_withdrawal_cooldown(&0);
+    pool_client.deposit(&lp, &token_id, &10_000);
+
+    let borrower = Address::generate(&env);
+    let history_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    nft_client.mint(
+        &borrower,
+        &600,
+        &history_hash,
+        &String::from_str(&env, "ipfs://QmTest"),
+        &None,
+    );
+    stellar_token.mint(&borrower, &10_000);
+
+    env.ledger().set_sequence_number(1_000);
+
+    let loan_id = manager.request_loan(&borrower, &1_000, &17_280);
+    manager.approve_loan(&loan_id);
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 17_280);
+
+    let loan = manager.get_loan(&loan_id);
+    let total_debt = loan.amount + loan.accrued_interest + loan.accrued_late_fee
+        - loan.principal_paid
+        - loan.interest_paid
+        - loan.late_fee_paid;
+    manager.repay(&borrower, &loan_id, &total_debt);
+
+    assert_eq!(manager.get_loan(&loan_id).status, LoanStatus::Repaid);
+    // Reporter not configured → managed assets unchanged (interest is surplus).
+    assert_eq!(pool_client.get_total_managed_assets(&token_id), 10_000);
+}
