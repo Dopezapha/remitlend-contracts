@@ -1707,3 +1707,87 @@ fn test_record_yield_rejected_when_no_shares_outstanding() {
     let res = pool_client.try_record_yield(&token_id, &100);
     assert_eq!(res, Err(Ok(crate::PoolError::InvalidAmount)));
 }
+
+#[test]
+fn test_record_yield_gated_to_configured_reporter() {
+    // Once a loan-manager reporter is configured for a token, it (and not the
+    // admin) is the authority for record_yield — this is what lets the
+    // repayment path credit interest automatically while still blocking
+    // arbitrary callers.
+    let env = Env::default();
+
+    let admin = Address::generate(&env);
+    let (token_id, stellar_asset_client, _token_client) = create_token_contract(&env, &admin);
+
+    let pool_id = env.register(LendingPool, ());
+    let pool_client = LendingPoolClient::new(&env, &pool_id);
+
+    env.mock_all_auths();
+    pool_client.initialize(&admin);
+    pool_client.set_withdrawal_cooldown(&0);
+
+    let provider = Address::generate(&env);
+    stellar_asset_client.mint(&provider, &1_000);
+    pool_client.deposit(&provider, &token_id, &1_000);
+
+    let reporter = Address::generate(&env);
+    pool_client.set_loan_manager(&token_id, &reporter);
+    assert_eq!(
+        pool_client.get_loan_manager(&token_id),
+        Some(reporter.clone())
+    );
+
+    // The configured reporter can record yield.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &reporter,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &pool_id,
+            fn_name: "record_yield",
+            args: (token_id.clone(), 100i128).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    pool_client.record_yield(&token_id, &100);
+    assert_eq!(pool_client.get_total_managed_assets(&token_id), 1_100);
+
+    // The admin is no longer the authority once a reporter is configured.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &pool_id,
+            fn_name: "record_yield",
+            args: (token_id.clone(), 50i128).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(pool_client.try_record_yield(&token_id, &50).is_err());
+}
+
+#[test]
+fn test_set_loan_manager_requires_admin() {
+    let env = Env::default();
+
+    let admin = Address::generate(&env);
+    let (token_id, _stellar_asset_client, _token_client) = create_token_contract(&env, &admin);
+
+    let pool_id = env.register(LendingPool, ());
+    let pool_client = LendingPoolClient::new(&env, &pool_id);
+
+    env.mock_all_auths();
+    pool_client.initialize(&admin);
+
+    let reporter = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &attacker,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &pool_id,
+            fn_name: "set_loan_manager",
+            args: (token_id.clone(), reporter.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(pool_client
+        .try_set_loan_manager(&token_id, &reporter)
+        .is_err());
+}

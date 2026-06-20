@@ -75,6 +75,12 @@ pub enum DataKey {
     /// exchange rate. Unaffected by direct token transfers or by principal
     /// temporarily out on loan. See the module-level accounting note.
     TotalManagedAssets(Address),
+    /// token → address authorized to report realized yield via `record_yield`
+    /// (normally the LoanManager that repayments flow through). Lets the
+    /// repayment path credit interest to LPs automatically while keeping
+    /// `record_yield` gated, so arbitrary callers still cannot move the share
+    /// price.
+    LoanManager(Address),
     /// token → number of active depositors
     DepositorCount(Address),
     ProposedAdmin,
@@ -172,6 +178,14 @@ impl LendingPool {
         Self::bump_instance_ttl(env);
     }
 
+    /// Address authorized to report realized yield for `token`, if configured.
+    fn loan_manager(env: &Env, token: &Address) -> Option<Address> {
+        Self::bump_instance_ttl(env);
+        env.storage()
+            .instance()
+            .get(&DataKey::LoanManager(token.clone()))
+    }
+
     fn read_shares(env: &Env, provider: &Address, token: &Address) -> i128 {
         let key = DataKey::Shares(provider.clone(), token.clone());
         let shares: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -242,9 +256,20 @@ impl LendingPool {
         total_assets_before: i128,
         cur_total_shares: i128,
     ) -> i128 {
-        if cur_total_shares == 0 || total_assets_before == 0 {
+        if cur_total_shares == 0 {
+            // First depositor into an empty share pool: 1:1 allocation.
             amount
         } else {
+            // Invariant: once shares exist, managed assets are strictly positive.
+            // deposit and redeem move shares and managed assets together, and
+            // record_yield only ever increases managed assets (and requires
+            // shares > 0), so `total_assets_before == 0` here is unreachable. The
+            // checked_div below would surface any violation as a panic rather
+            // than silently minting a diluting 1:1 allocation.
+            debug_assert!(
+                total_assets_before > 0,
+                "managed assets must be positive while shares are outstanding"
+            );
             amount
                 .checked_mul(cur_total_shares)
                 .and_then(|v| v.checked_div(total_assets_before))
@@ -342,12 +367,6 @@ impl LendingPool {
             .and_then(|v| v.checked_div(cur_total_shares))
             .expect("principal redeem overflow");
 
-        TokenClient::new(env, token).transfer(
-            &env.current_contract_address(),
-            provider,
-            &assets_to_return,
-        );
-
         let share_key = DataKey::Shares(provider.clone(), token.clone());
         let deposit_key = DataKey::DepositTimestamp(provider.clone(), token.clone());
         let remaining = cur_shares.checked_sub(shares).expect("share underflow");
@@ -386,6 +405,15 @@ impl LendingPool {
             .set(&DataKey::TotalDeposits(token.clone()), &new_total_deposits);
 
         Self::bump_instance_ttl(env);
+
+        // Interaction last (checks-effects-interactions): all accounting is
+        // committed before the token leaves the pool.
+        TokenClient::new(env, token).transfer(
+            &env.current_contract_address(),
+            provider,
+            &assets_to_return,
+        );
+
         Ok(assets_to_return)
     }
 
@@ -734,22 +762,49 @@ impl LendingPool {
         Ok(())
     }
 
+    /// Authorize `loan_manager` to report realized yield for `token` via
+    /// [`record_yield`](Self::record_yield). Set this to the LoanManager that
+    /// repayments flow through so interest is credited to LPs automatically.
+    /// Admin-gated.
+    pub fn set_loan_manager(env: Env, token: Address, loan_manager: Address) {
+        Self::admin(&env).require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::LoanManager(token.clone()), &loan_manager);
+        Self::bump_instance_ttl(&env);
+        loan_manager_updated(&env, token, loan_manager);
+    }
+
+    /// The address authorized to report yield for `token`, if any.
+    pub fn get_loan_manager(env: Env, token: Address) -> Option<Address> {
+        Self::loan_manager(&env, &token)
+    }
+
     /// Record `amount` of realized yield (e.g. loan interest repaid into the
     /// pool), raising every outstanding share's value pro-rata.
     ///
     /// This is the *only* way assets enter share value besides deposits. Because
     /// a contract cannot distinguish a legitimate interest repayment from an
     /// unsolicited donation by looking at its balance, yield is recognised
-    /// through this deliberate, admin-gated call rather than by reading the raw
+    /// through this deliberate, access-gated call rather than by reading the raw
     /// balance. That is precisely what stops a direct transfer from arbitrarily
     /// changing existing holders' redeemable value (issue #2).
+    ///
+    /// Authorization: the configured [`LoanManager`] reporter for `token` (so the
+    /// repayment path can credit interest automatically), or the admin when no
+    /// reporter is configured (manual / keeper operation).
     ///
     /// Yield is not principal, so it does not move `TotalDeposits` or count
     /// against the `MaxPoolSize` cap. The caller is responsible for ensuring the
     /// corresponding tokens are actually present in the pool; otherwise later
     /// redemptions will hit the `InsufficientLiquidity` gate.
     pub fn record_yield(env: Env, token: Address, amount: i128) -> Result<(), PoolError> {
-        Self::admin(&env).require_auth();
+        // Gate on the configured yield reporter, falling back to admin so the
+        // function is still usable manually before a LoanManager is wired up.
+        match Self::loan_manager(&env, &token) {
+            Some(reporter) => reporter.require_auth(),
+            None => Self::admin(&env).require_auth(),
+        }
         Self::assert_not_paused(&env)?;
 
         if amount <= 0 {

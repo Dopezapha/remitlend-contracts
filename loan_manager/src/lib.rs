@@ -26,6 +26,8 @@ pub trait RateOracleInterface {
 pub trait LendingPoolInterface {
     fn is_paused(env: Env) -> bool;
     fn pool_balance(env: Env, token: Address) -> i128;
+    fn record_yield(env: Env, token: Address, amount: i128);
+    fn get_loan_manager(env: Env, token: Address) -> Option<Address>;
 }
 
 mod events;
@@ -519,6 +521,28 @@ impl LoanManager {
 
         env.storage().instance().set(&key, &updated);
         Self::bump_instance_ttl(env);
+    }
+
+    /// Credit realized yield (loan interest, late fees, extension fees) to the
+    /// lending pool's LP share price.
+    ///
+    /// Since the pool now derives share value from internally-tracked managed
+    /// assets rather than its raw balance (lending_pool issue #2), interest that
+    /// is merely transferred into the pool would otherwise sit as uncounted
+    /// surplus and never reach depositors. This reports it explicitly.
+    ///
+    /// Best-effort and non-fatal: it only calls the pool when this manager is the
+    /// pool's configured yield reporter (otherwise the pool would reject the call
+    /// and revert the repayment), and it swallows any pool-side error (e.g. no LP
+    /// shares outstanding) so yield accounting can never block a repayment.
+    fn report_yield_to_pool(env: &Env, lending_pool: &Address, token: &Address, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+        let pool_client = PoolClient::new(env, lending_pool);
+        if pool_client.get_loan_manager(token) == Some(env.current_contract_address()) {
+            let _ = pool_client.try_record_yield(token, &amount);
+        }
     }
 
     fn borrower_loan_count(env: &Env, borrower: &Address) -> u32 {
@@ -1326,6 +1350,14 @@ impl LoanManager {
         let token_client = TokenClient::new(&env, &token);
         token_client.transfer(&borrower, &lending_pool, &amount);
 
+        // The interest and late-fee portions of the repayment are yield to LPs;
+        // the principal portion just returns borrowed principal. Credit only the
+        // yield so the pool's share price reflects earnings (lending_pool #2).
+        let yield_portion = interest_payment
+            .checked_add(late_fee_payment)
+            .expect("yield portion overflow");
+        Self::report_yield_to_pool(&env, &lending_pool, &token, yield_portion);
+
         if completed {
             // release_collateral_internal reads collateral from storage and performs
             // its own CEI, so it is safe to call after the loan state is committed.
@@ -1554,6 +1586,14 @@ impl LoanManager {
 
         if debt_repaid > 0 {
             token_client.transfer(&env.current_contract_address(), &lending_pool, &debt_repaid);
+            // NOTE: liquidation yield (recovered interest/late fees) is NOT
+            // reported to the pool here. Unlike a normal repayment, a liquidation
+            // can also leave a principal shortfall, and crediting the recovered
+            // interest as yield without a paired principal write-off would
+            // *inflate* LP share value during a loss event. Correct handling
+            // needs a `record_loss` companion in the pool; tracked as a
+            // follow-up to lending_pool #2. Recovered funds still sit in the pool
+            // as (uncounted) surplus, which is conservative/safe for LPs.
         }
         if liquidator_bonus > 0 {
             token_client.transfer(
@@ -2449,6 +2489,10 @@ impl LoanManager {
                 .expect("lending pool not set");
             let token_client = TokenClient::new(&env, &token);
             token_client.transfer(&borrower, &lending_pool, &extension_fee);
+
+            // The extension fee is pure income to the pool — credit it as yield
+            // so it accrues to LP share value (lending_pool #2).
+            Self::report_yield_to_pool(&env, &lending_pool, &token, extension_fee);
         }
 
         // Extend the due date
