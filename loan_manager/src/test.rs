@@ -677,7 +677,6 @@ fn test_partial_repayment_tracks_split_balances() {
 }
 
 #[test]
-#[should_panic(expected = "repayment amount below minimum")]
 fn test_minimum_repayment_amount_enforced() {
     let env = Env::default();
     env.mock_all_auths_allowing_non_root_auth();
@@ -704,7 +703,19 @@ fn test_minimum_repayment_amount_enforced() {
     manager.approve_loan(&loan_id);
 
     manager.set_min_repayment_amount(&150);
-    manager.repay(&borrower, &loan_id, &100);
+    let result = manager.try_repay(&borrower, &loan_id, &100);
+    assert_eq!(result, Err(Ok(LoanError::RepaymentBelowMinimum)));
+}
+
+#[test]
+fn test_set_min_repayment_amount_rejects_negative_values() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (manager, _nft_client, _pool_client, _token_id, _token_admin) = setup_test(&env);
+
+    let result = manager.try_set_min_repayment_amount(&-1);
+    assert_eq!(result, Err(Ok(LoanError::InvalidAmount)));
 }
 
 #[test]

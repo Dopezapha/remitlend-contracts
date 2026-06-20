@@ -60,6 +60,7 @@ pub enum LoanError {
     InvalidExtension = 25,
     InsufficientCollateral = 26,
     LoanNotLiquidatable = 27,
+    RepaymentBelowMinimum = 28,
 }
 
 #[contracttype]
@@ -513,6 +514,10 @@ impl LoanManager {
             .checked_add(delta)
             .expect("total outstanding overflow");
 
+        // This can only become negative if the contract state is inconsistent:
+        // repayment logic only ever subtracts the exact principal amount of a
+        // fully repaid loan, and the corresponding loan-approval bookkeeping
+        // prevents a second subtraction from the same outstanding balance.
         if updated < 0 {
             panic!("total outstanding underflow");
         }
@@ -1246,7 +1251,7 @@ impl LoanManager {
         let is_rounding_dust_forgiveness = total_debt <= min_repayment_amount;
 
         if amount < total_debt && amount < min_repayment_amount && !is_rounding_dust_forgiveness {
-            panic!("repayment amount below minimum");
+            return Err(LoanError::RepaymentBelowMinimum);
         }
 
         let token: Address = env
@@ -2012,16 +2017,16 @@ impl LoanManager {
         Self::max_loan_amount(&env)
     }
 
-    pub fn set_min_repayment_amount(env: Env, amount: i128) {
+    pub fn set_min_repayment_amount(env: Env, amount: i128) -> Result<(), LoanError> {
         if amount < 0 {
-            panic!("min repayment amount cannot be negative");
+            return Err(LoanError::InvalidAmount);
         }
 
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
-            .expect("not initialized");
+            .ok_or(LoanError::NotInitialized)?;
         admin.require_auth();
 
         let old_amount = Self::min_repayment_amount(&env);
@@ -2030,6 +2035,8 @@ impl LoanManager {
             .set(&DataKey::MinRepaymentAmount, &amount);
         Self::bump_instance_ttl(&env);
         events::min_repayment_updated(&env, admin, old_amount, amount);
+
+        Ok(())
     }
 
     pub fn get_min_repayment_amount(env: Env) -> i128 {
