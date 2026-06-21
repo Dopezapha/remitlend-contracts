@@ -130,7 +130,7 @@ pub struct GovernanceContract;
 #[contractimpl]
 impl GovernanceContract {
     const INSTANCE_TTL_THRESHOLD: u32 = 17280; // ~1 day (5s ledgers)
-    const INSTANCE_TTL_BUMP: u32 = 518400;     // ~30 days (5s ledgers)
+    const INSTANCE_TTL_BUMP: u32 = 518400; // ~30 days (5s ledgers)
 
     fn bump_instance_ttl(env: &Env) {
         env.storage()
